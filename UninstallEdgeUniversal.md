@@ -1,22 +1,33 @@
-<# 
-Remove-EdgeIE.ps1
+#Requires -RunAsAdministrator
+<#
+Remove-Edge-IE-All.ps1
 
-Aggressively removes/disables Microsoft Edge and Internet Explorer remnants
-on Windows 10 and Windows 11.
+Universal Windows 10/11 script to:
+- Stop Edge / IE related processes
+- Disable Internet Explorer optional feature
+- Remove legacy Edge AppX packages if present
+- Run Edge Chromium uninstallers if present
+- Remove Edge services and scheduled tasks
+- Remove system-level Edge / IE leftover folders
+- Remove selected Edge / IE registry leftovers
+- Recreate HKLM:\SOFTWARE\Microsoft\EdgeUpdate
+- Set DWORD DoNotUpdateToEdgeWithChromium = 1
 
-Run as Administrator.
+Usage:
+  Dry run:
+    .\Remove-Edge-IE-All.ps1
 
-Dry run:
-  .\Remove-EdgeIE.ps1
+  Apply:
+    .\Remove-Edge-IE-All.ps1 -Apply
 
-Apply changes:
-  .\Remove-EdgeIE.ps1 -Apply -AggressiveFolderRemoval
+  Apply with protected-folder ownership takeover:
+    .\Remove-Edge-IE-All.ps1 -Apply -AggressiveFolderRemoval
 
-More aggressive:
-  .\Remove-EdgeIE.ps1 -Apply -AggressiveFolderRemoval -IncludeUserProfiles
+  Also clean user profile data:
+    .\Remove-Edge-IE-All.ps1 -Apply -AggressiveFolderRemoval -IncludeUserProfiles
 
-Optional, risky:
-  .\Remove-EdgeIE.ps1 -Apply -AggressiveFolderRemoval -IncludeWebView2
+  Also remove WebView2 Runtime:
+    .\Remove-Edge-IE-All.ps1 -Apply -AggressiveFolderRemoval -IncludeWebView2
 #>
 
 [CmdletBinding()]
@@ -30,25 +41,15 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Continue"
 
-$IsAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $IsAdmin) {
-    throw "Run this script from an elevated PowerShell session: right-click PowerShell and choose 'Run as administrator'."
-}
-
 $LogRoot = Join-Path $env:ProgramData "EdgeIECleanup"
 New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
-$LogFile = Join-Path $LogRoot ("cleanup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 
+$LogFile = Join-Path $LogRoot ("cleanup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 Start-Transcript -Path $LogFile -Force | Out-Null
 
-$Os = Get-CimInstance Win32_OperatingSystem
-$Build = [int]$Os.BuildNumber
-
+$OS = Get-CimInstance Win32_OperatingSystem
 Write-Host ""
-Write-Host "Detected OS: $($Os.Caption) build $Build"
+Write-Host "Detected OS: $($OS.Caption) build $($OS.BuildNumber)"
 Write-Host "Log file: $LogFile"
 
 if (-not $Apply) {
@@ -56,65 +57,64 @@ if (-not $Apply) {
 }
 
 if ($IncludeWebView2) {
-    Write-Warning "IncludeWebView2 is enabled. This may break apps that use Microsoft Edge WebView2 Runtime."
+    Write-Warning "IncludeWebView2 enabled. Removing WebView2 may break apps that depend on it."
 }
 
-function Invoke-IfApply {
+function Invoke-Action {
     param(
-        [Parameter(Mandatory = $true)][string]$Label,
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock
+        [string]$Name,
+        [scriptblock]$Action
     )
 
     Write-Host ""
-    Write-Host "== $Label =="
-
-    if (-not $Apply) {
-        Write-Host "Dry run: skipped."
-        return
-    }
+    Write-Host "== $Name =="
 
     try {
-        & $ScriptBlock
+        & $Action
     }
     catch {
-        Write-Warning "$Label failed: $($_.Exception.Message)"
+        Write-Warning "$Name failed: $($_.Exception.Message)"
     }
 }
 
-function Invoke-ProcessLogged {
+function Stop-NamedProcesses {
+    param([string[]]$Names)
+
+    foreach ($name in $Names) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "Stopping process: $($_.ProcessName) PID $($_.Id)"
+            if ($Apply) {
+                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Run-Exe {
     param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [string]$Path,
+        [string[]]$Args
     )
 
-    if (-not (Test-Path -LiteralPath $FilePath)) {
+    if (-not (Test-Path -LiteralPath $Path)) {
         return
     }
 
-    Write-Host "Run: `"$FilePath`" $($Arguments -join ' ')"
+    Write-Host "Running: `"$Path`" $($Args -join ' ')"
 
-    if (-not $Apply) {
-        return
-    }
-
-    try {
-        $p = Start-Process -FilePath $FilePath `
-            -ArgumentList $Arguments `
-            -Wait `
-            -PassThru `
-            -WindowStyle Hidden
-
-        Write-Host "Exit code: $($p.ExitCode)"
-    }
-    catch {
-        Write-Warning "Failed to run $FilePath : $($_.Exception.Message)"
+    if ($Apply) {
+        try {
+            $p = Start-Process -FilePath $Path -ArgumentList $Args -Wait -PassThru -WindowStyle Hidden
+            Write-Host "Exit code: $($p.ExitCode)"
+        }
+        catch {
+            Write-Warning "Failed to run $Path : $($_.Exception.Message)"
+        }
     }
 }
 
 function Remove-PathSafe {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path
-    )
+    param([string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return
@@ -124,7 +124,7 @@ function Remove-PathSafe {
         return
     }
 
-    Write-Host "Remove path: $Path"
+    Write-Host "Removing path: $Path"
 
     if (-not $Apply) {
         return
@@ -132,362 +132,165 @@ function Remove-PathSafe {
 
     try {
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-        Write-Host "Removed: $Path"
         return
     }
     catch {
-        Write-Warning "Normal removal failed for $Path : $($_.Exception.Message)"
+        Write-Warning "Normal removal failed: $Path"
     }
 
     if ($AggressiveFolderRemoval) {
-        Write-Warning "Taking ownership and retrying removal: $Path"
+        Write-Warning "Taking ownership and retrying: $Path"
 
         try {
             & takeown.exe /F "$Path" /R /D Y | Out-Null
             & icacls.exe "$Path" /grant "*S-1-5-32-544:F" /T /C | Out-Null
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-            Write-Host "Removed after ownership change: $Path"
         }
         catch {
-            Write-Warning "Aggressive removal failed for $Path : $($_.Exception.Message)"
+            Write-Warning "Aggressive removal failed: $Path : $($_.Exception.Message)"
         }
-    }
-    else {
-        Write-Warning "Use -AggressiveFolderRemoval to take ownership and retry locked/protected folders."
     }
 }
 
 function Remove-RegPathSafe {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path
-    )
+    param([string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return
     }
 
-    Write-Host "Remove registry path: $Path"
+    Write-Host "Removing registry path: $Path"
 
-    if (-not $Apply) {
+    if ($Apply) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Registry removal failed: $Path : $($_.Exception.Message)"
+        }
+    }
+}
+
+function Disable-InternetExplorer {
+    $features = Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue |
+        Where-Object { $_.FeatureName -like "Internet-Explorer-Optional*" }
+
+    if (-not $features) {
+        Write-Host "Internet Explorer optional feature not found."
         return
     }
 
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "Registry removal failed for $Path : $($_.Exception.Message)"
+    foreach ($feature in $features) {
+        Write-Host "Disabling/removing IE feature: $($feature.FeatureName)"
+
+        if ($Apply) {
+            try {
+                Disable-WindowsOptionalFeature `
+                    -Online `
+                    -FeatureName $feature.FeatureName `
+                    -NoRestart `
+                    -Remove `
+                    -ErrorAction Stop | Out-Host
+            }
+            catch {
+                Write-Warning "Retrying without -Remove for $($feature.FeatureName)"
+
+                Disable-WindowsOptionalFeature `
+                    -Online `
+                    -FeatureName $feature.FeatureName `
+                    -NoRestart `
+                    -ErrorAction SilentlyContinue | Out-Host
+            }
+        }
     }
 }
 
-function Stop-ProcessSafe {
-    param([string[]]$Names)
+function Remove-LegacyEdgeAppx {
+    Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "Microsoft.MicrosoftEdge*" } |
+        ForEach-Object {
+            Write-Host "Removing AppX package: $($_.PackageFullName)"
 
-    foreach ($Name in $Names) {
-        $procs = Get-Process -Name $Name -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            Write-Host "Stop process: $($p.ProcessName) PID $($p.Id)"
             if ($Apply) {
-                try {
-                    Stop-Process -Id $p.Id -Force -ErrorAction Stop
-                }
-                catch {
-                    Write-Warning "Could not stop process $Name : $($_.Exception.Message)"
-                }
+                Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
             }
         }
-    }
+
+    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like "Microsoft.MicrosoftEdge*" } |
+        ForEach-Object {
+            Write-Host "Removing provisioned AppX package: $($_.PackageName)"
+
+            if ($Apply) {
+                Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Host
+            }
+        }
 }
 
-function Get-InstallerSetups {
-    param([string[]]$ProductFolders)
+function Get-EdgeSetups {
+    param([string[]]$Products)
 
-    $roots = New-Object System.Collections.Generic.List[string]
-
-    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-        if ([string]::IsNullOrWhiteSpace($base)) {
-            continue
-        }
-
-        foreach ($product in $ProductFolders) {
-            $root = Join-Path $base ("Microsoft\{0}\Application" -f $product)
-            if (Test-Path -LiteralPath $root) {
-                $roots.Add($root)
-            }
-
-            $rootNoApplication = Join-Path $base ("Microsoft\{0}" -f $product)
-            if (Test-Path -LiteralPath $rootNoApplication) {
-                $roots.Add($rootNoApplication)
-            }
-        }
-    }
+    $bases = @(
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
     $setups = @()
 
-    foreach ($root in ($roots | Select-Object -Unique)) {
-        try {
-            $items = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue
-            foreach ($item in $items) {
-                $setup = Join-Path $item.FullName "Installer\setup.exe"
-                if (Test-Path -LiteralPath $setup) {
-                    $setups += Get-Item -LiteralPath $setup
+    foreach ($base in $bases) {
+        foreach ($product in $Products) {
+            $appRoot = Join-Path $base "Microsoft\$product\Application"
+            $root = Join-Path $base "Microsoft\$product"
+
+            foreach ($scanRoot in @($appRoot, $root)) {
+                if (-not (Test-Path -LiteralPath $scanRoot)) {
+                    continue
+                }
+
+                Get-ChildItem -LiteralPath $scanRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    $setup = Join-Path $_.FullName "Installer\setup.exe"
+
+                    if (Test-Path -LiteralPath $setup) {
+                        $setups += Get-Item -LiteralPath $setup
+                    }
                 }
             }
-        }
-        catch {
-            Write-Warning "Could not scan $root : $($_.Exception.Message)"
         }
     }
 
     $setups | Sort-Object FullName -Unique
 }
 
-function Disable-EdgeServices {
-    $serviceNames = @(
-        "edgeupdate",
-        "edgeupdatem",
-        "MicrosoftEdgeElevationService"
-    )
+function Uninstall-EdgeChromium {
+    $setups = Get-EdgeSetups -Products @("Edge", "EdgeCore")
 
-    foreach ($svcName in $serviceNames) {
-        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($null -eq $svc) {
-            continue
-        }
+    foreach ($setup in $setups) {
+        Run-Exe -Path $setup.FullName -Args @(
+            "--uninstall",
+            "--system-level",
+            "--verbose-logging",
+            "--force-uninstall",
+            "--msedge"
+        )
 
-        Write-Host "Disable/delete service: $svcName"
-
-        if ($Apply) {
-            try {
-                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
-                Set-Service -Name $svcName -StartupType Disabled -ErrorAction SilentlyContinue
-                & sc.exe delete "$svcName" | Out-Null
-            }
-            catch {
-                Write-Warning "Could not remove service $svcName : $($_.Exception.Message)"
-            }
-        }
+        Run-Exe -Path $setup.FullName -Args @(
+            "--uninstall",
+            "--system-level",
+            "--verbose-logging",
+            "--force-uninstall"
+        )
     }
 }
 
-function Remove-EdgeScheduledTasks {
-    try {
-        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-            $_.TaskName -like "MicrosoftEdgeUpdate*" -or
-            $_.TaskPath -like "\Microsoft\EdgeUpdate*"
-        }
-
-        foreach ($task in $tasks) {
-            Write-Host "Remove scheduled task: $($task.TaskPath)$($task.TaskName)"
-            if ($Apply) {
-                try {
-                    Unregister-ScheduledTask `
-                        -TaskName $task.TaskName `
-                        -TaskPath $task.TaskPath `
-                        -Confirm:$false `
-                        -ErrorAction Stop
-                }
-                catch {
-                    Write-Warning "Could not remove task $($task.TaskName): $($_.Exception.Message)"
-                }
-            }
-        }
-    }
-    catch {
-        Write-Warning "Scheduled task scan failed: $($_.Exception.Message)"
-    }
-}
-
-function Disable-InternetExplorerFeature {
-    try {
-        $features = Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue |
-            Where-Object { $_.FeatureName -like "Internet-Explorer-Optional*" }
-
-        if (-not $features) {
-            Write-Host "No Internet Explorer optional feature found on this OS."
-            return
-        }
-
-        foreach ($feature in $features) {
-            Write-Host "Disable/remove Windows optional feature: $($feature.FeatureName) [$($feature.State)]"
-
-            if ($Apply) {
-                try {
-                    Disable-WindowsOptionalFeature `
-                        -Online `
-                        -FeatureName $feature.FeatureName `
-                        -NoRestart `
-                        -Remove `
-                        -ErrorAction Stop | Out-Host
-                }
-                catch {
-                    Write-Warning "Disable with -Remove failed for $($feature.FeatureName). Retrying without -Remove."
-                    try {
-                        Disable-WindowsOptionalFeature `
-                            -Online `
-                            -FeatureName $feature.FeatureName `
-                            -NoRestart `
-                            -ErrorAction Stop | Out-Host
-                    }
-                    catch {
-                        Write-Warning "Could not disable $($feature.FeatureName): $($_.Exception.Message)"
-                    }
-                }
-            }
-        }
-    }
-    catch {
-        Write-Warning "Internet Explorer feature removal failed: $($_.Exception.Message)"
-    }
-}
-
-function Remove-LegacyEdgeAppx {
-    Write-Host "Scan/remove legacy Microsoft Edge AppX packages."
-
-    try {
-        $packages = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -like "Microsoft.MicrosoftEdge*"
-            }
-
-        foreach ($pkg in $packages) {
-            Write-Host "Remove AppX package: $($pkg.Name) $($pkg.PackageFullName)"
-            if ($Apply) {
-                try {
-                    Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
-                }
-                catch {
-                    Write-Warning "Could not remove AppX package $($pkg.PackageFullName): $($_.Exception.Message)"
-                }
-            }
-        }
-    }
-    catch {
-        Write-Warning "AppX package scan failed: $($_.Exception.Message)"
+function Uninstall-WebView2 {
+    if (-not $IncludeWebView2) {
+        return
     }
 
-    try {
-        $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.DisplayName -like "Microsoft.MicrosoftEdge*"
-            }
+    $setups = Get-EdgeSetups -Products @("EdgeWebView")
 
-        foreach ($pkg in $provisioned) {
-            Write-Host "Remove provisioned AppX package: $($pkg.DisplayName) $($pkg.PackageName)"
-            if ($Apply) {
-                try {
-                    Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Host
-                }
-                catch {
-                    Write-Warning "Could not remove provisioned package $($pkg.PackageName): $($_.Exception.Message)"
-                }
-            }
-        }
-    }
-    catch {
-        Write-Warning "Provisioned AppX package scan failed: $($_.Exception.Message)"
-    }
-}
-
-function Remove-EdgeUninstallRegistryEntries {
-    $roots = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    )
-
-    foreach ($root in $roots) {
-        if (-not (Test-Path -LiteralPath $root)) {
-            continue
-        }
-
-        try {
-            $children = Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue
-            foreach ($child in $children) {
-                $props = Get-ItemProperty -LiteralPath $child.PSPath -ErrorAction SilentlyContinue
-                $displayName = $props.DisplayName
-
-                if ([string]::IsNullOrWhiteSpace($displayName)) {
-                    continue
-                }
-
-                $isEdge = $displayName -eq "Microsoft Edge" -or
-                    $displayName -eq "Microsoft Edge Update" -or
-                    ($IncludeWebView2 -and $displayName -like "Microsoft Edge WebView2*")
-
-                if ($isEdge) {
-                    Remove-RegPathSafe -Path $child.PSPath
-                }
-            }
-        }
-        catch {
-            Write-Warning "Could not scan uninstall registry root $root : $($_.Exception.Message)"
-        }
-    }
-}
-
-Invoke-IfApply "Create a restore point" {
-    try {
-        Checkpoint-Computer `
-            -Description "Before Microsoft Edge and Internet Explorer cleanup" `
-            -RestorePointType "MODIFY_SETTINGS" `
-            -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "Restore point creation failed or is disabled: $($_.Exception.Message)"
-    }
-}
-
-Write-Host ""
-Write-Host "== Stop browser/update processes =="
-Stop-ProcessSafe -Names @(
-    "msedge",
-    "MicrosoftEdgeUpdate",
-    "MicrosoftEdgeCP",
-    "MicrosoftEdgeSH",
-    "browser_broker",
-    "iexplore"
-)
-
-if ($IncludeWebView2) {
-    Stop-ProcessSafe -Names @("msedgewebview2")
-}
-
-Write-Host ""
-Write-Host "== Disable/remove Internet Explorer optional feature =="
-Disable-InternetExplorerFeature
-
-Write-Host ""
-Write-Host "== Remove legacy Edge AppX packages on Windows 10 if present =="
-Remove-LegacyEdgeAppx
-
-Write-Host ""
-Write-Host "== Run Microsoft Edge Chromium uninstallers if present =="
-$edgeSetups = Get-InstallerSetups -ProductFolders @("Edge", "EdgeCore")
-
-foreach ($setup in $edgeSetups) {
-    Invoke-ProcessLogged -FilePath $setup.FullName -Arguments @(
-        "--uninstall",
-        "--system-level",
-        "--verbose-logging",
-        "--force-uninstall",
-        "--msedge"
-    )
-
-    Invoke-ProcessLogged -FilePath $setup.FullName -Arguments @(
-        "--uninstall",
-        "--system-level",
-        "--verbose-logging",
-        "--force-uninstall"
-    )
-}
-
-if ($IncludeWebView2) {
-    Write-Host ""
-    Write-Host "== Run Microsoft Edge WebView2 uninstallers if present =="
-    $wvSetups = Get-InstallerSetups -ProductFolders @("EdgeWebView")
-
-    foreach ($setup in $wvSetups) {
-        Invoke-ProcessLogged -FilePath $setup.FullName -Arguments @(
+    foreach ($setup in $setups) {
+        Run-Exe -Path $setup.FullName -Args @(
             "--uninstall",
             "--system-level",
             "--verbose-logging",
@@ -497,138 +300,311 @@ if ($IncludeWebView2) {
     }
 }
 
-Write-Host ""
-Write-Host "== Remove Edge services and scheduled update tasks =="
-Disable-EdgeServices
-Remove-EdgeScheduledTasks
-
-Write-Host ""
-Write-Host "== Remove system-level folders and shortcuts =="
-
-$pf = $env:ProgramFiles
-$pf86 = ${env:ProgramFiles(x86)}
-$programData = $env:ProgramData
-$publicDesktop = Join-Path $env:PUBLIC "Desktop"
-
-$systemPaths = @(
-    $(if ($pf) { Join-Path $pf "Microsoft\Edge" }),
-    $(if ($pf) { Join-Path $pf "Microsoft\EdgeCore" }),
-    $(if ($pf) { Join-Path $pf "Microsoft\EdgeUpdate" }),
-    $(if ($pf86) { Join-Path $pf86 "Microsoft\Edge" }),
-    $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeCore" }),
-    $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeUpdate" }),
-    $(if ($programData) { Join-Path $programData "Microsoft\EdgeUpdate" }),
-    $(if ($programData) { Join-Path $programData "Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" }),
-    $(if ($publicDesktop) { Join-Path $publicDesktop "Microsoft Edge.lnk" }),
-
-    $(if ($pf) { Join-Path $pf "Internet Explorer" }),
-    $(if ($pf86) { Join-Path $pf86 "Internet Explorer" }),
-    $(if ($programData) { Join-Path $programData "Microsoft\Windows\Start Menu\Programs\Accessories\Internet Explorer.lnk" })
-)
-
-if ($IncludeWebView2) {
-    $systemPaths += @(
-        $(if ($pf) { Join-Path $pf "Microsoft\EdgeWebView" }),
-        $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeWebView" })
-    )
-}
-
-foreach ($path in ($systemPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-    Remove-PathSafe -Path $path
-}
-
-Write-Host ""
-Write-Host "== Remove selected Edge registry remnants =="
-
-$edgeRegPaths = @(
-    "HKLM:\SOFTWARE\Microsoft\Edge",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Edge",
-    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate",
-    "HKLM:\SOFTWARE\Clients\StartMenuInternet\Microsoft Edge",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
-)
-
-foreach ($regPath in $edgeRegPaths) {
-    Remove-RegPathSafe -Path $regPath
-}
-
-Remove-EdgeUninstallRegistryEntries
-
-if ($IncludeWebView2) {
-    $wvRegPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\EdgeWebView",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeWebView"
+function Remove-EdgeServicesAndTasks {
+    $services = @(
+        "edgeupdate",
+        "edgeupdatem",
+        "MicrosoftEdgeElevationService"
     )
 
-    foreach ($regPath in $wvRegPaths) {
-        Remove-RegPathSafe -Path $regPath
+    foreach ($service in $services) {
+        $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+
+        if ($null -ne $svc) {
+            Write-Host "Disabling/deleting service: $service"
+
+            if ($Apply) {
+                Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
+                & sc.exe delete "$service" | Out-Null
+            }
+        }
     }
+
+    Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.TaskName -like "MicrosoftEdgeUpdate*" -or
+            $_.TaskPath -like "\Microsoft\EdgeUpdate*"
+        } |
+        ForEach-Object {
+            Write-Host "Removing scheduled task: $($_.TaskPath)$($_.TaskName)"
+
+            if ($Apply) {
+                Unregister-ScheduledTask `
+                    -TaskName $_.TaskName `
+                    -TaskPath $_.TaskPath `
+                    -Confirm:$false `
+                    -ErrorAction SilentlyContinue
+            }
+        }
 }
 
-if ($IncludeUserProfiles) {
-    Write-Host ""
-    Write-Host "== Remove Edge/IE data from user profiles =="
+function Remove-SystemFolders {
+    $pf = $env:ProgramFiles
+    $pf86 = ${env:ProgramFiles(x86)}
+    $pd = $env:ProgramData
+    $publicDesktop = Join-Path $env:PUBLIC "Desktop"
 
-    $profilesRoot = Join-Path $env:SystemDrive "Users"
+    $paths = @(
+        $(if ($pf) { Join-Path $pf "Microsoft\Edge" }),
+        $(if ($pf) { Join-Path $pf "Microsoft\EdgeCore" }),
+        $(if ($pf) { Join-Path $pf "Microsoft\EdgeUpdate" }),
 
-    if (Test-Path -LiteralPath $profilesRoot) {
-        $profiles = Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -notin @(
-                    "Default",
-                    "Default User",
-                    "Public",
-                    "All Users"
+        $(if ($pf86) { Join-Path $pf86 "Microsoft\Edge" }),
+        $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeCore" }),
+        $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeUpdate" }),
+
+        $(if ($pd) { Join-Path $pd "Microsoft\EdgeUpdate" }),
+        $(if ($pd) { Join-Path $pd "Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" }),
+
+        $(if ($publicDesktop) { Join-Path $publicDesktop "Microsoft Edge.lnk" }),
+
+        $(if ($pf) { Join-Path $pf "Internet Explorer" }),
+        $(if ($pf86) { Join-Path $pf86 "Internet Explorer" }),
+        $(if ($pd) { Join-Path $pd "Microsoft\Windows\Start Menu\Programs\Accessories\Internet Explorer.lnk" })
+    )
+
+    if ($IncludeWebView2) {
+        $paths += @(
+            $(if ($pf) { Join-Path $pf "Microsoft\EdgeWebView" }),
+            $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeWebView" })
+        )
+    }
+
+    $paths |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique |
+        ForEach-Object {
+            Remove-PathSafe -Path $_
+        }
+}
+
+function Remove-UserProfileFolders {
+    if (-not $IncludeUserProfiles) {
+        return
+    }
+
+    $usersRoot = Join-Path $env:SystemDrive "Users"
+
+    if (-not (Test-Path -LiteralPath $usersRoot)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $usersRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @("Default", "Default User", "Public", "All Users") } |
+        ForEach-Object {
+            $profile = $_.FullName
+
+            $paths = @(
+                (Join-Path $profile "AppData\Local\Microsoft\Edge"),
+                (Join-Path $profile "AppData\Local\Microsoft\Edge SxS"),
+                (Join-Path $profile "AppData\Local\Microsoft\EdgeUpdate"),
+                (Join-Path $profile "AppData\Local\Microsoft\Internet Explorer"),
+                (Join-Path $profile "AppData\Roaming\Microsoft\Internet Explorer"),
+                (Join-Path $profile "AppData\Local\Packages\Microsoft.MicrosoftEdge_8wekyb3d8bbwe")
+            )
+
+            if ($IncludeWebView2) {
+                $paths += @(
+                    (Join-Path $profile "AppData\Local\Microsoft\EdgeWebView")
                 )
             }
 
-        foreach ($profile in $profiles) {
-            $userPaths = @(
-                (Join-Path $profile.FullName "AppData\Local\Microsoft\Edge"),
-                (Join-Path $profile.FullName "AppData\Local\Microsoft\Edge SxS"),
-                (Join-Path $profile.FullName "AppData\Local\Microsoft\EdgeUpdate"),
-                (Join-Path $profile.FullName "AppData\Local\Microsoft\Internet Explorer"),
-                (Join-Path $profile.FullName "AppData\Roaming\Microsoft\Internet Explorer"),
-                (Join-Path $profile.FullName "AppData\Local\Packages\Microsoft.MicrosoftEdge_8wekyb3d8bbwe")
-            )
+            $paths | ForEach-Object {
+                Remove-PathSafe -Path $_
+            }
+        }
+}
 
-            foreach ($path in $userPaths) {
-                Remove-PathSafe -Path $path
+function Remove-EdgeIERegistryLeftovers {
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Edge",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Edge",
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate",
+        "HKLM:\SOFTWARE\Clients\StartMenuInternet\Microsoft Edge",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+        "HKLM:\SOFTWARE\Microsoft\Internet Explorer",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Internet Explorer"
+    )
+
+    if ($IncludeWebView2) {
+        $regPaths += @(
+            "HKLM:\SOFTWARE\Microsoft\EdgeWebView",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeWebView"
+        )
+    }
+
+    foreach ($path in $regPaths) {
+        Remove-RegPathSafe -Path $path
+    }
+
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+
+    foreach ($root in $uninstallRoots) {
+        if (-not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+
+        Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            $displayName = $props.DisplayName
+
+            if ([string]::IsNullOrWhiteSpace($displayName)) {
+                return
+            }
+
+            $match = $displayName -eq "Microsoft Edge" -or
+                     $displayName -eq "Microsoft Edge Update" -or
+                     $displayName -like "Internet Explorer*" -or
+                     ($IncludeWebView2 -and $displayName -like "Microsoft Edge WebView2*")
+
+            if ($match) {
+                Remove-RegPathSafe -Path $_.PSPath
             }
         }
     }
 }
 
-Write-Host ""
-Write-Host "== Final check =="
+function Set-EdgeUpdateBlockRegistryKey {
+    $path = "HKLM:\SOFTWARE\Microsoft\EdgeUpdate"
+    $name = "DoNotUpdateToEdgeWithChromium"
 
-$checkPaths = @(
-    $(if ($pf) { Join-Path $pf "Microsoft\Edge" }),
-    $(if ($pf86) { Join-Path $pf86 "Microsoft\Edge" }),
-    $(if ($pf) { Join-Path $pf "Internet Explorer" }),
-    $(if ($pf86) { Join-Path $pf86 "Internet Explorer" })
-)
+    Write-Host "Creating registry key: $path"
+    Write-Host "Setting DWORD: $name = 1"
 
-if ($IncludeWebView2) {
-    $checkPaths += @(
-        $(if ($pf) { Join-Path $pf "Microsoft\EdgeWebView" }),
-        $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeWebView" })
-    )
+    if (-not $Apply) {
+        return
+    }
+
+    try {
+        New-Item -Path $path -Force | Out-Null
+
+        New-ItemProperty `
+            -Path $path `
+            -Name $name `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+        Write-Host "Registry value set successfully."
+    }
+    catch {
+        Write-Warning "Failed to set EdgeUpdate registry value: $($_.Exception.Message)"
+    }
 }
 
-foreach ($path in ($checkPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-    if (Test-Path -LiteralPath $path) {
-        Write-Warning "Still exists: $path"
+function Final-Check {
+    $pf = $env:ProgramFiles
+    $pf86 = ${env:ProgramFiles(x86)}
+
+    $paths = @(
+        $(if ($pf) { Join-Path $pf "Microsoft\Edge" }),
+        $(if ($pf86) { Join-Path $pf86 "Microsoft\Edge" }),
+        $(if ($pf) { Join-Path $pf "Internet Explorer" }),
+        $(if ($pf86) { Join-Path $pf86 "Internet Explorer" })
+    )
+
+    if ($IncludeWebView2) {
+        $paths += @(
+            $(if ($pf) { Join-Path $pf "Microsoft\EdgeWebView" }),
+            $(if ($pf86) { Join-Path $pf86 "Microsoft\EdgeWebView" })
+        )
+    }
+
+    foreach ($path in ($paths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $path) {
+            Write-Warning "Still exists: $path"
+        }
+        else {
+            Write-Host "Gone: $path"
+        }
+    }
+
+    $blockKey = "HKLM:\SOFTWARE\Microsoft\EdgeUpdate"
+    $value = Get-ItemProperty -Path $blockKey -Name "DoNotUpdateToEdgeWithChromium" -ErrorAction SilentlyContinue
+
+    if ($value.DoNotUpdateToEdgeWithChromium -eq 1) {
+        Write-Host "Confirmed registry value: HKLM\SOFTWARE\Microsoft\EdgeUpdate\DoNotUpdateToEdgeWithChromium = 1"
     }
     else {
-        Write-Host "Gone: $path"
+        Write-Warning "Registry value was not confirmed."
     }
+}
+
+Invoke-Action "Create restore point" {
+    if ($Apply) {
+        Checkpoint-Computer `
+            -Description "Before Edge and IE removal" `
+            -RestorePointType "MODIFY_SETTINGS" `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-Action "Stop Edge and IE processes" {
+    $processes = @(
+        "msedge",
+        "MicrosoftEdgeUpdate",
+        "MicrosoftEdgeCP",
+        "MicrosoftEdgeSH",
+        "browser_broker",
+        "iexplore"
+    )
+
+    if ($IncludeWebView2) {
+        $processes += "msedgewebview2"
+    }
+
+    Stop-NamedProcesses -Names $processes
+}
+
+Invoke-Action "Disable Internet Explorer optional feature" {
+    Disable-InternetExplorer
+}
+
+Invoke-Action "Remove legacy Edge AppX packages" {
+    Remove-LegacyEdgeAppx
+}
+
+Invoke-Action "Run Edge Chromium uninstallers" {
+    Uninstall-EdgeChromium
+}
+
+Invoke-Action "Run WebView2 uninstallers if requested" {
+    Uninstall-WebView2
+}
+
+Invoke-Action "Remove Edge services and scheduled tasks" {
+    Remove-EdgeServicesAndTasks
+}
+
+Invoke-Action "Remove system-level folders and shortcuts" {
+    Remove-SystemFolders
+}
+
+Invoke-Action "Remove user profile folders if requested" {
+    Remove-UserProfileFolders
+}
+
+Invoke-Action "Remove Edge and IE registry leftovers" {
+    Remove-EdgeIERegistryLeftovers
+}
+
+Invoke-Action "Create EdgeUpdate registry key and block Edge Chromium update" {
+    Set-EdgeUpdateBlockRegistryKey
+}
+
+Invoke-Action "Final check" {
+    Final-Check
 }
 
 Write-Host ""
 Write-Host "Cleanup finished."
 Write-Host "A reboot is strongly recommended."
+Write-Host "Log file: $LogFile"
 
 Stop-Transcript | Out-Null
